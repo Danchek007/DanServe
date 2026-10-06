@@ -1,8 +1,8 @@
 """
-DanServe engine.
-Координатор + клиент + WireGuard + сети.
-Windows: через wireguard.exe (служба).
-Linux/Mac: через wg-quick.
+DanServe coordinator — серверная часть.
+Координатор + сети + WireGuard.
+Запуск: python engine.py server
+Работает на Render/Northflank/Fly/VPS — порт берётся из $PORT.
 """
 import os
 import sys
@@ -24,10 +24,10 @@ IS_MAC     = platform.system() == "Darwin"
 CREATE_NO_WINDOW = 0x08000000
 
 IFACE       = "wg0"
-SERVER_PORT = 8765
+SERVER_PORT = int(os.environ.get("PORT", "8765"))
 WG_PORT     = 51820
 SUBNET_PFX  = "10.66."
-PUBLIC_SERVERS = []   # при желании — список чужих координаторов
+PUBLIC_SERVERS = []
 
 if IS_WINDOWS:
     WG_EXE     = Path(r"C:\Program Files\WireGuard\wireguard.exe")
@@ -180,8 +180,40 @@ class _CoordHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
 
+    # ---------- GET (ping, корень) ----------
+    def do_GET(self):
+        if self.path in ("/ping", "/health"):
+            self._json({"status": "ok", "time": time.time(),
+                        "service": "DanServe Coordinator"})
+        elif self.path == "/":
+            self._json({
+                "name": "DanServe Coordinator",
+                "status": "ok",
+                "endpoints": [
+                    "POST /network/join",
+                    "POST /network/peers",
+                    "POST /network/leave",
+                    "GET  /ping",
+                ],
+            })
+        elif self.path == "/networks/list":
+            with self.lock:
+                data = [
+                    {"id": nid, "name": n["name"],
+                     "subnet": f"{SUBNET_PFX}{n['subnet_idx']}.0/24",
+                     "nodes": len(n["nodes"])}
+                    for nid, n in self.networks.items()
+                ]
+            self._json({"networks": data})
+        else:
+            self._json({"error": "not found"}, 404)
+
+    # ---------- POST ----------
     def do_POST(self):
         ln = int(self.headers.get("Content-Length", 0))
         try:
@@ -192,7 +224,6 @@ class _CoordHandler(BaseHTTPRequestHandler):
             "/network/join":  self._join,
             "/network/peers": self._peers,
             "/network/leave": self._leave,
-            "/networks/list": self._list,
         }.get(self.path)
         if not route:
             return self._json({"error": "not found"}, 404)
@@ -273,18 +304,9 @@ class _CoordHandler(BaseHTTPRequestHandler):
                 del self.networks[nid]
         self._json({"ok": True})
 
-    def _list(self, p):
-        with self.lock:
-            data = [
-                {"id": nid, "name": n["name"],
-                 "subnet": f"{SUBNET_PFX}{n['subnet_idx']}.0/24",
-                 "nodes": len(n["nodes"])}
-                for nid, n in self.networks.items()
-            ]
-        self._json({"networks": data})
 
-
-def start_coord_server(port=SERVER_PORT):
+def start_coord_server(port=None):
+    port = port or SERVER_PORT
     srv = HTTPServer(("0.0.0.0", port), _CoordHandler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
@@ -337,7 +359,7 @@ class DanServeEngine:
         with self._lock:
             self.log_lines.append(line)
             self.log_lines = self.log_lines[-200:]
-        print(line)
+        print(line, flush=True)
 
     def get_peers(self):
         with self._lock:
@@ -348,7 +370,7 @@ class DanServeEngine:
         if self.running:
             return
         if run_local_server:
-            start_coord_server(SERVER_PORT)
+            start_coord_server()
             threading.Thread(target=gc_loop, daemon=True).start()
             server_url = f"http://127.0.0.1:{SERVER_PORT}"
             self.log(f"Локальный координатор на :{SERVER_PORT}")
@@ -427,11 +449,11 @@ class DanServeEngine:
 
 
 # ============================================================
-# РУЧНОЙ ЗАПУСК
+# ЗАПУСК
 # ============================================================
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "server":
-        print(f"Координатор на :{SERVER_PORT}")
+        print(f"Координатор на :{SERVER_PORT}", flush=True)
         start_coord_server()
         threading.Thread(target=gc_loop, daemon=True).start()
         try:
@@ -440,4 +462,4 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             pass
     else:
-        print("Запускай через gui.py, или: python engine.py server")
+        print("Запускай через gui.py, либо: python engine.py server")
